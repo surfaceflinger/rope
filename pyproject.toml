@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rope"
+version = "0.1.0"
+description = "Analyze facial attributes in image directories using DeepFace"
+requires-python = ">=3.12"
+dependencies = ["deepface", "pillow"]
+
+[tool.setuptools]
+py-modules = ["rope"]
+
+[project.scripts]
+rope = "rope:main"
