@@ -1,4 +1,5 @@
 import argparse
+import json
 from datetime import datetime
 from pathlib import Path
 from collections import defaultdict
@@ -12,6 +13,7 @@ ATTRIBUTES = ["gender", "race", "emotion"]
 def get_image_info(path: str) -> tuple[datetime | None, tuple[int, int]]:
     import PIL.Image
     import PIL.ExifTags
+
     try:
         img = PIL.Image.open(path)
         size = img.size  # (width, height)
@@ -45,7 +47,26 @@ def record_face(stats: dict, face: dict) -> None:
             stats["scores"][a][k].append(float(v))
 
 
-def analyze_image(path: str, all_stats: dict, period_stats: dict[str, dict], months: int) -> None:
+def load_cache(cache_file: Path) -> dict[str, list[dict]]:
+    if cache_file.exists():
+        with open(cache_file) as f:
+            return json.load(f)
+    return {}
+
+
+def save_cache(cache_file: Path, cache: dict[str, list[dict]]) -> None:
+    with open(cache_file, "w") as f:
+        json.dump(cache, f)
+
+
+def analyze_image(
+    path: str,
+    all_stats: dict,
+    period_stats: dict[str, dict],
+    months: int,
+    cache: dict[str, list[dict]] | None = None,
+    base_dir: Path | None = None,
+) -> None:
     print(f"\n{'=' * 60}")
     print(f"File: {path}")
 
@@ -53,13 +74,25 @@ def analyze_image(path: str, all_stats: dict, period_stats: dict[str, dict], mon
     if dt:
         print(f"Date: {dt.strftime('%Y-%m-%d %H:%M')}")
 
-    print('=' * 60)
+    print("=" * 60)
     try:
-        try:
-            results = DeepFace.analyze(img_path=path, actions=["age", "gender", "race", "emotion"])
-        except ValueError:
-            results = DeepFace.analyze(img_path=path, actions=["age", "gender", "race", "emotion"],
-                                       enforce_detection=False)
+        cache_key = str(Path(path).relative_to(base_dir)) if base_dir else None
+
+        if cache is not None and cache_key and cache_key in cache:
+            results = cache[cache_key]
+            print("  (cached)")
+        else:
+            try:
+                results = DeepFace.analyze(img_path=path, actions=["age", "gender", "race", "emotion"])
+            except ValueError:
+                results = DeepFace.analyze(
+                    img_path=path,
+                    actions=["age", "gender", "race", "emotion"],
+                    enforce_detection=False,
+                )
+            results = json.loads(json.dumps(results, default=float))
+            if cache is not None and cache_key:
+                cache[cache_key] = results
 
         # drop faces that are much smaller than the largest (reflections, artifacts)
         # also drop faces touching image edges (likely reflections/crops)
@@ -72,9 +105,7 @@ def analyze_image(path: str, all_stats: dict, period_stats: dict[str, dict], mon
                 return False
             r = f["region"]
             margin = 5
-            return r["x"] <= margin or r["y"] <= margin or \
-                (img_w and r["x"] + r["w"] >= img_w - margin) or \
-                (img_h and r["y"] + r["h"] >= img_h - margin)
+            return r["x"] <= margin or r["y"] <= margin or (img_w and r["x"] + r["w"] >= img_w - margin) or (img_h and r["y"] + r["h"] >= img_h - margin)
 
         real_faces = [f for f in results if f["region"]["w"] >= threshold and not is_edge_face(f)]
         if not real_faces:
@@ -111,7 +142,7 @@ def print_summary(stats: dict, label: str = "SUMMARY") -> None:
 
     print(f"\n{'=' * 60}")
     print(f"{label} ({n} faces)")
-    print('=' * 60)
+    print("=" * 60)
 
     print(f"\n  Average age: {sum(stats['ages']) / n:.1f}")
 
@@ -119,17 +150,35 @@ def print_summary(stats: dict, label: str = "SUMMARY") -> None:
         print(f"\n  {a.title()} distribution:")
         for k, count in sorted(stats["counts"][a].items(), key=lambda x: -x[1]):
             print(f"    {k:20s}: {count:4d} ({100 * count / n:.1f}%)")
+        if a == "gender":
+            print(f"    ^ don't worry about this ratio — it just reflects how many photos you have, not how you look now. check the trend table below for what matters")
         print(f"\n  Average {a} confidence:")
         for k in sorted(stats["scores"][a]):
             avg = sum(stats["scores"][a][k]) / n
             print(f"    {k:20s}: {avg:.1f}%")
+        if a == "gender":
+            print(f"    ^ ignore this — averaged over your whole collection, it's meaningless. check the trend table instead")
+
+
+def _robust_edge(scores: list[float], side: str) -> float:
+    if not scores:
+        return 0.0
+    s = sorted(scores)
+    k = max(1, len(s) // 5)  # average the ~20% most extreme values
+    chunk = s[:k] if side == "min" else s[-k:]
+    return sum(chunk) / len(chunk)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Analyze faces in images using DeepFace")
     parser.add_argument("directory", help="Directory containing images")
-    parser.add_argument("-m", "--months", type=int, default=4,
-                        help="Number of months per period for trend analysis (default: 4)")
+    parser.add_argument(
+        "-m",
+        "--months",
+        type=int,
+        default=4,
+        help="Number of months per period for trend analysis (default: 4)",
+    )
     args = parser.parse_args()
 
     directory = Path(args.directory)
@@ -143,14 +192,26 @@ def main() -> None:
         print(f"No images found in '{directory}'")
         raise SystemExit(0)
 
+    cache_file = Path(directory.name + "-cache.json")
+    cache = load_cache(cache_file)
     print(f"Found {len(images)} image(s) in '{directory}'")
+    print(f"Cache: {cache_file} ({len(cache)} entries)")
     print(f"(filtering out detected faces smaller than {MIN_FACE_SIZE}px)")
 
     all_stats = new_stats()
     period_stats: dict[str, dict] = {}
 
     for img in images:
-        analyze_image(str(img), all_stats, period_stats, args.months)
+        analyze_image(
+            str(img),
+            all_stats,
+            period_stats,
+            args.months,
+            cache=cache,
+            base_dir=directory,
+        )
+
+    save_cache(cache_file, cache)
 
     print_summary(all_stats, "OVERALL SUMMARY")
 
@@ -160,37 +221,57 @@ def main() -> None:
 
         print(f"\n\n{'=' * 60}")
         print(f"TRENDS BY {args.months}-MONTH PERIODS")
-        print('=' * 60)
+        print("=" * 60)
 
         def row(label: str, values: list[str]) -> str:
             return f"  {label:20s}" + "".join(f"  {v:>{col}s}" for v in values)
 
         print(row("", periods))
         print(row("faces", [str(len(period_stats[p]["ages"])) for p in periods]))
-        print(row("avg age", [
-            f"{sum(period_stats[p]['ages']) / len(period_stats[p]['ages']):.1f}"
-            for p in periods
-        ]))
+        print(
+            row(
+                "avg age",
+                [f"{sum(period_stats[p]['ages']) / len(period_stats[p]['ages']):.1f}" for p in periods],
+            )
+        )
 
         print()
         all_genders = sorted({g for p in periods for g in period_stats[p]["counts"]["gender"]})
         for g in all_genders:
-            print(row(g, [
-                f"{100 * period_stats[p]['counts']['gender'].get(g, 0) / len(period_stats[p]['ages']):.0f}%"
-                for p in periods
-            ]))
-            print(row(f"  avg {g.lower()}", [
-                f"{sum(period_stats[p]['scores']['gender'].get(g, [])) / len(period_stats[p]['ages']):.1f}%"
-                for p in periods
-            ]))
+            print(
+                row(
+                    g,
+                    [f"{100 * period_stats[p]['counts']['gender'].get(g, 0) / len(period_stats[p]['ages']):.0f}%" for p in periods],
+                )
+            )
+            print(
+                row(
+                    f"  avg {g.lower()}",
+                    [f"{sum(period_stats[p]['scores']['gender'].get(g, [])) / len(period_stats[p]['ages']):.1f}%" for p in periods],
+                )
+            )
+            print(
+                row(
+                    f"  min {g.lower()}",
+                    [f"{_robust_edge(period_stats[p]['scores']['gender'].get(g, []), 'min'):.1f}%" for p in periods],
+                )
+            )
+            print(
+                row(
+                    f"  max {g.lower()}",
+                    [f"{_robust_edge(period_stats[p]['scores']['gender'].get(g, []), 'max'):.1f}%" for p in periods],
+                )
+            )
 
         print()
         all_emotions = sorted({e for p in periods for e in period_stats[p]["scores"]["emotion"]})
         for e in all_emotions:
-            print(row(e, [
-                f"{sum(period_stats[p]['scores']['emotion'].get(e, [])) / len(period_stats[p]['ages']):.1f}%"
-                for p in periods
-            ]))
+            print(
+                row(
+                    e,
+                    [f"{sum(period_stats[p]['scores']['emotion'].get(e, [])) / len(period_stats[p]['ages']):.1f}%" for p in periods],
+                )
+            )
 
     print()
 
